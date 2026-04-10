@@ -600,6 +600,7 @@ public static class ProfileCommand
 		"-c", "Release",
 		"-r", runtimeIdentifier,
 		"--self-contained",
+		"-p:UseAppHost=true",
 		"-p:PublishSingleFile=true",
 		"-p:PublishTrimmed=false",
 		"-p:TreatWarningsAsErrors=false",

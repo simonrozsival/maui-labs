@@ -40,6 +40,8 @@ public static class ProfileCommand
 	const string StartupProfilingInjectionTargetsFileName = "MauiStartupProfilingInjection.targets";
 	const string StartupProfilingInjectionSourceFileName = "MauiStartupProfiling.AutoInitialize.cs";
 	const string SpeedscopeExtension = ".speedscope.json";
+	const string MibcExtension = ".mibc";
+	const string DotnetPgoDisplayPath = "~/.maui/dotnet-pgo";
 
 	// MSBuild SDK path env vars set by a parent `dotnet run` process that would otherwise
 	// pin the child build to the wrong SDK version (e.g. the CLI's own SDK instead of the
@@ -69,11 +71,11 @@ public static class ProfileCommand
 		};
 		var outputOption = new Option<string?>("--output", "-o")
 		{
-			Description = "Output trace path (default: <project>_<timestamp>.nettrace in the current directory). Speedscope also emits a sibling .speedscope.json file."
+			Description = "Output trace path (default: <project>_<timestamp>.nettrace in the current directory). Speedscope and MIBC also emit sibling derived files while keeping the raw .nettrace."
 		};
 		var formatOption = new Option<string>("--format")
 		{
-			Description = "Output format to generate: nettrace (default) or speedscope.",
+			Description = "Output format to generate: nettrace (default), speedscope, or mibc.",
 			DefaultValueFactory = _ => "nettrace"
 		};
 		var configurationOption = new Option<string>("--configuration", "-c")
@@ -206,6 +208,10 @@ public static class ProfileCommand
 					WasOptionExplicitlySpecified(parseResult, formatOption),
 					isCi || useJson,
 					formatter as SpectreOutputFormatter);
+
+				if (outputFormat == TraceOutputFormat.Mibc)
+					_ = ResolveDotnetPgoPath();
+
 				var outputPath = ResolveOutputPath(project.ProjectName, parseResult.GetValue(outputOption), outputFormat);
 				var result = await RunProfileAsync(
 					project,
@@ -498,16 +504,17 @@ public static class ProfileCommand
 				.Title("[bold]Select the trace output format[/]")
 				.HighlightStyle(new Style(Color.DodgerBlue1))
 				.UseConverter(FormatTraceOutputPromptChoice)
-				.AddChoices([TraceOutputFormat.NetTrace, TraceOutputFormat.Speedscope]));
+				.AddChoices([TraceOutputFormat.NetTrace, TraceOutputFormat.Speedscope, TraceOutputFormat.Mibc]));
 	}
 
 	internal static TraceOutputFormat ResolveTraceOutputFormat(string? requestedFormat) => requestedFormat?.Trim().ToLowerInvariant() switch
 	{
 		null or "" or "nettrace" => TraceOutputFormat.NetTrace,
 		"speedscope" => TraceOutputFormat.Speedscope,
+		"mibc" => TraceOutputFormat.Mibc,
 		_ => throw new MauiToolException(
 			ErrorCodes.InvalidArgument,
-			$"Unsupported output format '{requestedFormat}'. Supported values are: nettrace, speedscope.")
+			$"Unsupported output format '{requestedFormat}'. Supported values are: nettrace, speedscope, mibc.")
 	};
 
 	internal static string ResolveOutputPath(string projectName, string? requestedOutput, TraceOutputFormat outputFormat)
@@ -525,6 +532,11 @@ public static class ProfileCommand
 		{
 			fullPath = fullPath[..^SpeedscopeExtension.Length];
 		}
+		else if (outputFormat == TraceOutputFormat.Mibc &&
+			fullPath.EndsWith(MibcExtension, StringComparison.OrdinalIgnoreCase))
+		{
+			fullPath = Path.ChangeExtension(fullPath, "nettrace");
+		}
 
 		if (string.IsNullOrWhiteSpace(Path.GetExtension(fullPath)))
 			fullPath += ".nettrace";
@@ -534,6 +546,7 @@ public static class ProfileCommand
 	internal static string GetPrimaryOutputPath(string collectorOutputPath, TraceOutputFormat outputFormat) => outputFormat switch
 	{
 		TraceOutputFormat.Speedscope => collectorOutputPath + SpeedscopeExtension,
+		TraceOutputFormat.Mibc => Path.ChangeExtension(collectorOutputPath, "mibc"),
 		_ => collectorOutputPath
 	};
 
@@ -541,6 +554,7 @@ public static class ProfileCommand
 	{
 		TraceOutputFormat.NetTrace => "nettrace",
 		TraceOutputFormat.Speedscope => "speedscope",
+		TraceOutputFormat.Mibc => "mibc",
 		_ => outputFormat.ToString().ToLowerInvariant()
 	};
 
@@ -548,6 +562,7 @@ public static class ProfileCommand
 	{
 		TraceOutputFormat.NetTrace => "[bold]nettrace[/] [dim](raw EventPipe trace for PerfView / Visual Studio)[/]",
 		TraceOutputFormat.Speedscope => "[bold]speedscope[/] [dim](browser-friendly flame chart; also keeps the raw .nettrace)[/]",
+		TraceOutputFormat.Mibc => "[bold]mibc[/] [dim](creates a reusable PGO profile and keeps the raw .nettrace)[/]",
 		_ => $"[bold]{Markup.Escape(FormatOutputFormat(outputFormat))}[/]"
 	};
 
@@ -840,6 +855,20 @@ public static class ProfileCommand
 			}
 		}
 
+		if (outputFormat == TraceOutputFormat.Mibc)
+		{
+			await ConvertNetTraceToMibcAsync(
+				project,
+				framework,
+				configuration,
+				outputPath,
+				primaryOutputPath,
+				formatter,
+				useJson,
+				verbose,
+				cancellationToken);
+		}
+
 		if (!File.Exists(primaryOutputPath))
 		{
 			throw new MauiToolException(
@@ -858,7 +887,7 @@ public static class ProfileCommand
 			Configuration = configuration,
 			Format = FormatOutputFormat(outputFormat),
 			OutputPath = primaryOutputPath,
-			RawTracePath = outputFormat == TraceOutputFormat.Speedscope ? outputPath : null,
+			RawTracePath = outputFormat is TraceOutputFormat.Speedscope or TraceOutputFormat.Mibc ? outputPath : null,
 			DsrouterKind = dsrouterKind,
 			DiagnosticAddress = diagnosticAddress,
 			DiagnosticPort = diagnosticPort,
@@ -1119,6 +1148,156 @@ public static class ProfileCommand
 		}
 
 		return args;
+	}
+
+	static async Task ConvertNetTraceToMibcAsync(
+		ResolvedMauiProject project,
+		string framework,
+		string configuration,
+		string netTracePath,
+		string mibcPath,
+		IOutputFormatter formatter,
+		bool useJson,
+		bool verbose,
+		CancellationToken cancellationToken)
+	{
+		if (!File.Exists(netTracePath))
+		{
+			throw new MauiToolException(
+				ErrorCodes.InternalError,
+				$"Raw trace '{netTracePath}' was not created, so MIBC conversion cannot continue.");
+		}
+
+		var dotnetPgoPath = ResolveDotnetPgoPath();
+		var referenceAssemblies = ResolveMibcReferenceAssemblies(project, framework, configuration);
+		if (referenceAssemblies.Count == 0)
+		{
+			throw MauiToolException.UserActionRequired(
+				ErrorCodes.DiagnosticsToolNotFound,
+				$"MIBC conversion could not find any reference assemblies for '{project.ProjectName}'.",
+				[
+					$"Build the Android target '{framework}' first so its linked/shrunk assemblies exist.",
+					"Then run 'maui profile --format mibc' again."
+				]);
+		}
+
+		if (!useJson)
+			formatter.WriteInfo("Converting the raw trace to MIBC...");
+
+		var args = BuildMibcArguments(netTracePath, mibcPath, referenceAssemblies).ToArray();
+		WriteVerbose(formatter, useJson, verbose, $"dotnet-pgo command: {FormatCommandLine(dotnetPgoPath, args)}");
+
+		var result = await ProcessRunner.RunAsync(
+			dotnetPgoPath,
+			args,
+			project.ProjectDirectory,
+			timeout: s_buildLaunchTimeout,
+			cancellationToken: cancellationToken);
+
+		if (!result.Success)
+			throw CreateProcessFailureException("dotnet-pgo create-mibc", result);
+	}
+
+	internal static IEnumerable<string> BuildMibcArguments(
+		string netTracePath,
+		string mibcPath,
+		IReadOnlyList<string> referenceAssemblies)
+	{
+		var args = new List<string>
+		{
+			"create-mibc",
+			"--trace",
+			netTracePath,
+			"--output",
+			mibcPath
+		};
+
+		foreach (var referenceAssembly in referenceAssemblies)
+		{
+			args.Add("--reference");
+			args.Add(referenceAssembly);
+		}
+
+		return args;
+	}
+
+	static string ResolveDotnetPgoPath()
+	{
+		var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+		if (string.IsNullOrWhiteSpace(userProfile))
+		{
+			throw new MauiToolException(
+				ErrorCodes.DiagnosticsToolNotFound,
+				"Could not resolve the current user's home directory to locate dotnet-pgo.");
+		}
+
+		var expectedPath = Path.Combine(userProfile, ".maui", "dotnet-pgo");
+		if (File.Exists(expectedPath))
+			return expectedPath;
+
+		if (OperatingSystem.IsWindows())
+		{
+			var windowsPath = expectedPath + ".exe";
+			if (File.Exists(windowsPath))
+				return windowsPath;
+		}
+
+		throw MauiToolException.UserActionRequired(
+			ErrorCodes.DiagnosticsToolNotFound,
+			$"MIBC conversion requires dotnet-pgo at '{expectedPath}'.",
+			[
+				$"Install or copy the dotnet-pgo binary to {DotnetPgoDisplayPath}.",
+				"Then rerun 'maui profile --format mibc'."
+			]);
+	}
+
+	static IReadOnlyList<string> ResolveMibcReferenceAssemblies(
+		ResolvedMauiProject project,
+		string framework,
+		string configuration)
+	{
+		var candidateRoots = GetMibcReferenceSearchRoots(project, framework, configuration).ToArray();
+		if (candidateRoots.Length == 0)
+			return [];
+
+		var linkedOrShrunkAssemblies = candidateRoots
+			.SelectMany(root => Directory.EnumerateFiles(root, "*.dll", SearchOption.AllDirectories))
+			.Where(static path => path.Contains($"{Path.DirectorySeparatorChar}linked{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase)
+				|| path.Contains($"{Path.AltDirectorySeparatorChar}linked{Path.AltDirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase)
+				|| path.Contains($"{Path.DirectorySeparatorChar}shrunk{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase)
+				|| path.Contains($"{Path.AltDirectorySeparatorChar}shrunk{Path.AltDirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase))
+			.Distinct(StringComparer.OrdinalIgnoreCase)
+			.OrderBy(static path => path, StringComparer.OrdinalIgnoreCase)
+			.ToArray();
+
+		if (linkedOrShrunkAssemblies.Length > 0)
+			return linkedOrShrunkAssemblies;
+
+		return candidateRoots
+			.SelectMany(root => Directory.EnumerateFiles(root, "*.dll", SearchOption.AllDirectories))
+			.Distinct(StringComparer.OrdinalIgnoreCase)
+			.OrderBy(static path => path, StringComparer.OrdinalIgnoreCase)
+			.ToArray();
+	}
+
+	static IEnumerable<string> GetMibcReferenceSearchRoots(
+		ResolvedMauiProject project,
+		string framework,
+		string configuration)
+	{
+		var searchRoots = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+		{
+			Path.Combine(project.ProjectDirectory, "obj", configuration, framework),
+			Path.Combine(project.ProjectDirectory, "bin", configuration, framework)
+		};
+
+		for (var current = new DirectoryInfo(project.ProjectDirectory); current is not null; current = current.Parent)
+		{
+			searchRoots.Add(Path.Combine(current.FullName, "artifacts", "obj", project.ProjectName, configuration, framework));
+			searchRoots.Add(Path.Combine(current.FullName, "artifacts", "bin", project.ProjectName, configuration, framework));
+		}
+
+		return searchRoots.Where(Directory.Exists);
 	}
 
 	static string FormatDuration(TimeSpan duration)
@@ -1865,7 +2044,8 @@ internal sealed record StoppingEventConfiguration(
 internal enum TraceOutputFormat
 {
 	NetTrace,
-	Speedscope
+	Speedscope,
+	Mibc
 }
 
 internal sealed record ProfilingBuildInjection(

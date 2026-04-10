@@ -106,6 +106,18 @@ public class ProfileCommandTests
 	}
 
 	[Fact]
+	public void ResolveTraceOutputFormat_UsesExplicitMibcValue()
+	{
+		var result = ProfileCommand.ResolveTraceOutputFormat(
+			requestedFormat: "mibc",
+			explicitlySpecified: true,
+			nonInteractive: false,
+			spectre: null);
+
+		Assert.Equal(TraceOutputFormat.Mibc, result);
+	}
+
+	[Fact]
 	public void ProfileCommand_DefaultPlatformIsAll()
 	{
 		var command = ProfileCommand.Create();
@@ -266,6 +278,20 @@ public class ProfileCommandTests
 	{
 		var path = ProfileCommand.GetPrimaryOutputPath("/tmp/my-trace.nettrace", TraceOutputFormat.Speedscope);
 		Assert.Equal("/tmp/my-trace.nettrace.speedscope.json", path);
+	}
+
+	[Fact]
+	public void ResolveOutputPath_MibcStripsRequestedMibcSuffix()
+	{
+		var path = ProfileCommand.ResolveOutputPath("MyApp", "/tmp/my-trace.mibc", TraceOutputFormat.Mibc);
+		Assert.Equal(Path.GetFullPath("/tmp/my-trace.nettrace"), path);
+	}
+
+	[Fact]
+	public void GetPrimaryOutputPath_MibcUsesSiblingMibcFile()
+	{
+		var path = ProfileCommand.GetPrimaryOutputPath("/tmp/my-trace.nettrace", TraceOutputFormat.Mibc);
+		Assert.Equal("/tmp/my-trace.mibc", path);
 	}
 
 	// ── Tool version parsing ──────────────────────────────────────────────────
@@ -519,6 +545,24 @@ public class ProfileCommandTests
 		var formatIdx = Array.IndexOf(args, "--format");
 		Assert.True(formatIdx >= 0);
 		Assert.Equal("Speedscope", args[formatIdx + 1]);
+	}
+
+	[Fact]
+	public void BuildTraceArguments_Mibc_UsesNetTraceCollectorFormat()
+	{
+		var args = ProfileCommand.BuildTraceArguments(
+			outputPath: "/out.nettrace",
+			outputFormat: TraceOutputFormat.Mibc,
+			dsrouterPid: 12345,
+			traceProfile: null,
+			duration: null,
+			stoppingEventProvider: null,
+			stoppingEventName: null,
+			stoppingEventPayloadFilter: null).ToArray();
+
+		var formatIdx = Array.IndexOf(args, "--format");
+		Assert.True(formatIdx >= 0);
+		Assert.Equal("NetTrace", args[formatIdx + 1]);
 	}
 
 

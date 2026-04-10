@@ -42,6 +42,7 @@ public static class ProfileCommand
 	const string SpeedscopeExtension = ".speedscope.json";
 	const string MibcExtension = ".mibc";
 	const string DotnetPgoDisplayPath = "~/.maui/dotnet-pgo";
+	const string MibcDotnetRuntimeProvider = "Microsoft-Windows-DotNETRuntime:0x6000080018:5";
 
 	// MSBuild SDK path env vars set by a parent `dotnet run` process that would otherwise
 	// pin the child build to the wrong SDK version (e.g. the CLI's own SDK instead of the
@@ -1099,12 +1100,14 @@ public static class ProfileCommand
 			"--resume-runtime"
 		};
 
+		var requiresExtraRuntimeProviders = outputFormat == TraceOutputFormat.Mibc;
+
 		if (!string.IsNullOrWhiteSpace(traceProfile))
 		{
 			args.Add("--profile");
 			args.Add(traceProfile);
 		}
-		else if (!string.IsNullOrWhiteSpace(stoppingEventProvider))
+		else if (!string.IsNullOrWhiteSpace(stoppingEventProvider) || requiresExtraRuntimeProviders)
 		{
 			// When a stopping event provider is specified but no explicit --profile, we must
 			// explicitly include the default collection profiles.
@@ -1118,6 +1121,16 @@ public static class ProfileCommand
 			args.Add(FormatDuration(durationValue));
 		}
 
+		var providers = new List<string>();
+		if (requiresExtraRuntimeProviders)
+		{
+			// dotnet-pgo create-mibc requires MethodDetails/JIT events in the raw trace.
+			// The official dotnet-pgo guidance recommends at least:
+			// Microsoft-Windows-DotNETRuntime:0x4000080018:5
+			// We also include the ReadyToRun bit (0x2000000000), producing 0x6000080018:5.
+			providers.Add(MibcDotnetRuntimeProvider);
+		}
+
 		if (!string.IsNullOrWhiteSpace(stoppingEventProvider))
 		{
 			// Explicitly enable the stopping event provider in the EventPipe session.
@@ -1125,8 +1138,13 @@ public static class ProfileCommand
 			// the provider must also appear in --providers so EventPipe actually delivers its
 			// events to dotnet-trace (otherwise the stop never triggers).
 			// Per dotnet-trace docs, --providers is additive on top of --profile.
+			providers.Add($"{stoppingEventProvider}:ffffffffffffffff:5");
+		}
+
+		if (providers.Count > 0)
+		{
 			args.Add("--providers");
-			args.Add($"{stoppingEventProvider}:ffffffffffffffff:5");
+			args.Add(string.Join(",", providers));
 		}
 
 		if (!string.IsNullOrWhiteSpace(stoppingEventProvider))

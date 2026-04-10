@@ -45,7 +45,8 @@ internal static class ProfileSessionSetup
 			: ProfileCommandBuildInjectionResolver.TryCreateBuildInjection(
 				context.DiagnosticAddress,
 				context.ReservedPorts.ExitControlPort,
-				injectBootstrap: !hasStartupProfilingHelper);
+				injectBootstrap: !hasStartupProfilingHelper,
+				enableMibcPgo: context.OutputFormat == TraceOutputFormat.Mibc);
 
 		WriteDiagnosticPortInfo(context);
 		return context;

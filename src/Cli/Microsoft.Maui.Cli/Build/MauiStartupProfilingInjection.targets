@@ -42,6 +42,24 @@
                                              Condition="'$(MauiStartupProfilingExitHost)' != ''" />
       <_MauiStartupProfilingEnvironmentLines Include="MAUI_STARTUP_PROFILING_EXIT_PORT=$(MauiStartupProfilingExitPort)"
                                              Condition="'$(MauiStartupProfilingExitPort)' != ''" />
+      <_MauiStartupProfilingEnvironmentLines Include="DOTNET_TieredPGO=1"
+                                             Condition="'$(MauiStartupProfilingEnableMibcPgo)' == 'true'" />
+      <_MauiStartupProfilingEnvironmentLines Include="DOTNET_TieredPGO_InstrumentOnlyHotCode=0"
+                                             Condition="'$(MauiStartupProfilingEnableMibcPgo)' == 'true'" />
+      <_MauiStartupProfilingEnvironmentLines Include="DOTNET_TC_QuickJitForLoops=1"
+                                             Condition="'$(MauiStartupProfilingEnableMibcPgo)' == 'true'" />
+      <_MauiStartupProfilingEnvironmentLines Include="DOTNET_TC_CallCountThreshold=10000"
+                                             Condition="'$(MauiStartupProfilingEnableMibcPgo)' == 'true'" />
+      <_MauiStartupProfilingEnvironmentLines Include="DOTNET_ReadyToRun=0"
+                                             Condition="'$(MauiStartupProfilingEnableMibcPgo)' == 'true'" />
+      <_MauiStartupProfilingEnvironmentLines Include="DOTNET_JitMinimalJitProfiling=1"
+                                             Condition="'$(MauiStartupProfilingEnableMibcPgo)' == 'true'" />
+      <_MauiStartupProfilingEnvironmentLines Include="DOTNET_JitProfileCasts=1"
+                                             Condition="'$(MauiStartupProfilingEnableMibcPgo)' == 'true'" />
+      <_MauiStartupProfilingEnvironmentLines Include="DOTNET_JitDelegateProfiling=0"
+                                             Condition="'$(MauiStartupProfilingEnableMibcPgo)' == 'true'" />
+      <_MauiStartupProfilingEnvironmentLines Include="DOTNET_MULTILEVEL_LOOKUP=0"
+                                             Condition="'$(MauiStartupProfilingEnableMibcPgo)' == 'true'" />
     </ItemGroup>
 
     <WriteLinesToFile File="$(_MauiStartupProfilingEnvironmentFile)"

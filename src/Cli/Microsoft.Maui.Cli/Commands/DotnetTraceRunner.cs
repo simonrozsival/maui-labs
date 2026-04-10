@@ -91,12 +91,14 @@ internal static class DotnetTraceRunner
 			"--resume-runtime"
 		};
 
+		var requiresExtraRuntimeProviders = outputFormat == TraceOutputFormat.Mibc;
+
 		if (!string.IsNullOrWhiteSpace(traceProfile))
 		{
 			args.Add("--profile");
 			args.Add(traceProfile);
 		}
-		else if (!string.IsNullOrWhiteSpace(stoppingEventProvider))
+		else if (!string.IsNullOrWhiteSpace(stoppingEventProvider) || requiresExtraRuntimeProviders)
 		{
 			args.Add("--profile");
 			args.Add("dotnet-common,dotnet-sampled-thread-time");
@@ -108,10 +110,22 @@ internal static class DotnetTraceRunner
 			args.Add(FormatDuration(durationValue));
 		}
 
+		var providers = new List<string>();
+		if (requiresExtraRuntimeProviders)
+		{
+			// dotnet-pgo create-mibc needs runtime MethodDetails/JIT data in the raw trace.
+			providers.Add(ProfileCommand.MibcDotnetRuntimeProvider);
+		}
+
 		if (!string.IsNullOrWhiteSpace(stoppingEventProvider))
 		{
+			providers.Add($"{stoppingEventProvider}:ffffffffffffffff:5");
+		}
+
+		if (providers.Count > 0)
+		{
 			args.Add("--providers");
-			args.Add($"{stoppingEventProvider}:ffffffffffffffff:5");
+			args.Add(string.Join(",", providers));
 		}
 
 		if (!string.IsNullOrWhiteSpace(stoppingEventProvider))

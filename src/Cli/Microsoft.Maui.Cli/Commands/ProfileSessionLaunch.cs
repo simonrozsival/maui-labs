@@ -141,7 +141,7 @@ internal static class ProfileSessionLaunch
 		if (context.TraceProcess is not null && context.TraceProcess.Process.HasExited)
 		{
 			context.Formatter.WriteWarning(
-				"Trace collection completed during app launch before a manual stop request. " +
+				"Trace collection completed before a manual stop request. " +
 				"This usually means the target process disconnected and the trace finalized early.");
 			return;
 		}

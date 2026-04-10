@@ -45,7 +45,7 @@ public static class ProfileCommand
 	const string DotnetPgoDisplayPath = "~/.maui/dotnet-pgo";
 	const string MibcDotnetRuntimeProvider = "Microsoft-Windows-DotNETRuntime:0x6000080018:5";
 	const string DotnetPgoRuntimeRepoUrl = "https://github.com/dotnet/runtime.git";
-	const string DotnetPgoDefaultBranch = "release/10.0";
+	const string DotnetPgoFallbackBranch = "release/10.0";
 	const string DotnetPgoBranchEnvironmentVariable = "MAUI_DOTNET_PGO_BRANCH";
 	const string DotnetPgoProjectPath = "src/coreclr/tools/dotnet-pgo/dotnet-pgo.csproj";
 
@@ -1305,6 +1305,70 @@ public static class ProfileCommand
 		"-o", outputDirectory
 	];
 
+	internal static string? ParseLatestStableDotnetRuntimeReleaseBranch(string? lsRemoteOutput)
+	{
+		if (string.IsNullOrWhiteSpace(lsRemoteOutput))
+			return null;
+
+		return lsRemoteOutput
+			.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+			.Select(line => line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).LastOrDefault())
+			.Where(static token => !string.IsNullOrWhiteSpace(token))
+			.Select(static token => Regex.Match(token!, @"(?:refs/heads/)?(release/\d+\.\d+)$"))
+			.Where(static match => match.Success)
+			.Select(static match =>
+			{
+				var branch = match.Groups[1].Value;
+				var versionText = branch["release/".Length..];
+				return Version.TryParse(versionText, out var version)
+					? new { Branch = branch, Version = version }
+					: null;
+			})
+			.Where(static candidate => candidate is not null)
+			.OrderByDescending(static candidate => candidate!.Version)
+			.Select(static candidate => candidate!.Branch)
+			.FirstOrDefault();
+	}
+
+	static async Task<string> ResolveDotnetPgoSourceBranchAsync(
+		string gitPath,
+		IOutputFormatter formatter,
+		bool useJson,
+		bool verbose,
+		CancellationToken cancellationToken)
+	{
+		var overrideBranch = Environment.GetEnvironmentVariable(DotnetPgoBranchEnvironmentVariable);
+		if (!string.IsNullOrWhiteSpace(overrideBranch))
+		{
+			WriteVerbose(formatter, useJson, verbose, $"Using dotnet-pgo source branch override from {DotnetPgoBranchEnvironmentVariable}: {overrideBranch}");
+			return overrideBranch.Trim();
+		}
+
+		var lsRemoteResult = await ProcessRunner.RunAsync(
+			gitPath,
+			["ls-remote", "--heads", DotnetPgoRuntimeRepoUrl, "refs/heads/release/*"],
+			timeout: TimeSpan.FromSeconds(30),
+			cancellationToken: cancellationToken);
+
+		if (lsRemoteResult.Success &&
+			ParseLatestStableDotnetRuntimeReleaseBranch(lsRemoteResult.StandardOutput) is { } latestStableBranch)
+		{
+			WriteVerbose(formatter, useJson, verbose, $"Selected latest stable dotnet/runtime release branch for dotnet-pgo: {latestStableBranch}");
+			return latestStableBranch;
+		}
+
+		if (!useJson)
+			formatter.WriteWarning($"Could not detect the latest stable dotnet/runtime release branch automatically. Falling back to {DotnetPgoFallbackBranch}.");
+
+		WriteVerbose(
+			formatter,
+			useJson,
+			verbose,
+			$"Falling back to {DotnetPgoFallbackBranch} because git ls-remote failed or returned no stable release branches. Output: {lsRemoteResult.StandardOutput} {lsRemoteResult.StandardError}".Trim());
+
+		return DotnetPgoFallbackBranch;
+	}
+
 	static async Task<string> BuildDotnetPgoFromSourceAsync(
 		IOutputFormatter formatter,
 		bool useJson,
@@ -1335,7 +1399,7 @@ public static class ProfileCommand
 		var dotnetRoot = Path.Combine(cloneDirectory, ".dotnet");
 		var publishDirectory = Path.Combine(cloneDirectory, "artifacts", "dotnet-pgo");
 		var installPath = GetDotnetPgoInstallPath(userProfile);
-		var runtimeBranch = Environment.GetEnvironmentVariable(DotnetPgoBranchEnvironmentVariable) ?? DotnetPgoDefaultBranch;
+		var runtimeBranch = await ResolveDotnetPgoSourceBranchAsync(gitPath, formatter, useJson, verbose, cancellationToken);
 
 		try
 		{

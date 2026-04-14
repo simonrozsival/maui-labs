@@ -91,12 +91,14 @@ internal static class DotnetTraceRunner
 			"--resume-runtime"
 		};
 
+		var requiresExtraRuntimeProviders = outputFormat == TraceOutputFormat.Mibc;
+
 		if (!string.IsNullOrWhiteSpace(traceProfile))
 		{
 			args.Add("--profile");
 			args.Add(traceProfile);
 		}
-		else if (!string.IsNullOrWhiteSpace(stoppingEventProvider))
+		else if (!string.IsNullOrWhiteSpace(stoppingEventProvider) || requiresExtraRuntimeProviders)
 		{
 			args.Add("--profile");
 			args.Add("dotnet-common,dotnet-sampled-thread-time");
@@ -108,10 +110,22 @@ internal static class DotnetTraceRunner
 			args.Add(FormatDuration(durationValue));
 		}
 
+		var providers = new List<string>();
+		if (requiresExtraRuntimeProviders)
+		{
+			// dotnet-pgo create-mibc needs runtime MethodDetails/JIT data in the raw trace.
+			providers.Add(ProfileCommand.MibcDotnetRuntimeProvider);
+		}
+
 		if (!string.IsNullOrWhiteSpace(stoppingEventProvider))
 		{
+			providers.Add($"{stoppingEventProvider}:ffffffffffffffff:5");
+		}
+
+		if (providers.Count > 0)
+		{
 			args.Add("--providers");
-			args.Add($"{stoppingEventProvider}:ffffffffffffffff:5");
+			args.Add(string.Join(",", providers));
 		}
 
 		if (!string.IsNullOrWhiteSpace(stoppingEventProvider))
@@ -145,7 +159,7 @@ internal static class DotnetTraceRunner
 		var details = traceProcess.GetCombinedOutput();
 		throw new MauiToolException(
 			ErrorCodes.InternalError,
-			"dotnet-trace exited before the app launch started.",
+			"dotnet-trace exited before the profiling session could be established.",
 			nativeError: details);
 	}
 
@@ -192,7 +206,7 @@ internal static class DotnetTraceRunner
 					formatter,
 					useJson,
 					verbose,
-					$"Waiting briefly for dotnet-trace (PID {traceProcess.Process.Id}) to connect after launching the suspended iOS app.");
+					$"Waiting briefly for dotnet-trace (PID {traceProcess.Process.Id}) to connect after launching the suspended app.");
 				await EnsureStartedAsync(traceProcess, cancellationToken);
 				return traceProcess;
 			}
@@ -204,14 +218,14 @@ internal static class DotnetTraceRunner
 					formatter,
 					useJson,
 					verbose,
-					$"dotnet-trace could not connect yet; retrying in {ProfileCommand.s_traceStartupRetryDelay.TotalSeconds:0.#}s while the iOS runtime finishes opening its diagnostics channel.");
+					$"dotnet-trace could not connect yet; retrying in {ProfileCommand.s_traceStartupRetryDelay.TotalSeconds:0.#}s while the app runtime finishes opening its diagnostics channel.");
 				await Task.Delay(ProfileCommand.s_traceStartupRetryDelay, cancellationToken);
 			}
 		}
 
 		throw lastFailure ?? new MauiToolException(
 			ErrorCodes.InternalError,
-			$"dotnet-trace could not connect to the iOS app within {ProfileCommand.s_traceStartupRetryTimeout.TotalSeconds:0}s.");
+			$"dotnet-trace could not connect to the app within {ProfileCommand.s_traceStartupRetryTimeout.TotalSeconds:0}s.");
 	}
 
 	internal static bool IsRetryableStartupFailure(string? details)

@@ -103,6 +103,8 @@ internal static class ProfileCommandArguments
 		args.Add($"-p:MauiStartupProfilingExitHost={buildInjection.ExitControlHost}");
 		args.Add($"-p:MauiStartupProfilingExitPort={buildInjection.ExitControlPort}");
 		args.Add($"-p:MauiStartupProfilingInjectBootstrap={(buildInjection.InjectBootstrap ? "true" : "false")}");
+		if (buildInjection.EnableMibcPgo)
+			args.Add("-p:MauiStartupProfilingEnableMibcPgo=true");
 
 		if (!string.IsNullOrWhiteSpace(buildInjection.AssemblyPath))
 			args.Add($"-p:MauiStartupProfilingAssemblyPath={buildInjection.AssemblyPath}");

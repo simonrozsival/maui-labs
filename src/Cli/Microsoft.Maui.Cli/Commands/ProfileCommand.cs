@@ -4,10 +4,13 @@
 using System.CommandLine;
 using System.CommandLine.Parsing;
 using System.Net;
+using System.Runtime.InteropServices;
+using System.Text;
 using Microsoft.Maui.Cli.Errors;
 using Microsoft.Maui.Cli.Models;
 using Microsoft.Maui.Cli.Output;
 using Microsoft.Maui.Cli.Services;
+using Microsoft.Maui.Cli.Utils;
 using Spectre.Console;
 
 namespace Microsoft.Maui.Cli.Commands;
@@ -35,6 +38,15 @@ public static class ProfileCommand
 	internal const string StartupProfilingInjectionTargetsFileName = "MauiStartupProfilingInjection.targets";
 	internal const string StartupProfilingInjectionSourceFileName = "MauiStartupProfiling.AutoInitialize.cs";
 	internal const string SpeedscopeExtension = ".speedscope.json";
+	internal const string MibcExtension = ".mibc";
+	internal const string DotnetPgoDisplayPath = "~/.maui/dotnet-pgo";
+	internal const string MibcDotnetRuntimeProvider = "Microsoft-Windows-DotNETRuntime:0x1F000080018:5";
+	internal const string DotnetPgoRuntimeRepoUrl = "https://github.com/dotnet/runtime.git";
+	internal const string DotnetPgoFallbackBranch = "release/10.0";
+	internal const string DotnetPgoBranchEnvironmentVariable = "MAUI_DOTNET_PGO_BRANCH";
+	internal const string DotnetPgoProjectPath = "src/coreclr/tools/dotnet-pgo/dotnet-pgo.csproj";
+	internal const int DotnetPgoStatusTailLineCount = 5;
+	internal const int DotnetPgoStatusMaxLineLength = 120;
 
 	// MSBuild SDK path env vars set by a parent `dotnet run` process that would otherwise
 	// pin the child build to the wrong SDK version (e.g. the CLI's own SDK instead of the
@@ -71,11 +83,11 @@ public static class ProfileCommand
 		};
 		var outputOption = new Option<string?>("--output", "-o")
 		{
-			Description = "Output trace path (default: <project>_<timestamp>.nettrace in the current directory). Speedscope also emits a sibling .speedscope.json file."
+			Description = "Output trace path (default: <project>_<timestamp>.nettrace in the current directory). Speedscope and MIBC also emit sibling derived files while keeping the raw .nettrace."
 		};
 		var formatOption = new Option<string>("--format")
 		{
-			Description = "Output format to generate: nettrace (default) or speedscope.",
+			Description = "Output format to generate: nettrace (default), speedscope, or mibc.",
 			DefaultValueFactory = _ => "nettrace"
 		};
 		var configurationOption = new Option<string>("--configuration", "-c")
@@ -247,6 +259,10 @@ public static class ProfileCommand
 				WasOptionExplicitlySpecified(parseResult, formatOption),
 				isCi || useJson,
 				formatter as SpectreOutputFormatter);
+
+			if (outputFormat == TraceOutputFormat.Mibc)
+				_ = await DotnetPgoInstaller.EnsureAvailableAsync(formatter, useJson, verbose, cancellationToken);
+
 			var configuration = ResolveProfileConfiguration(
 				parseResult.GetValue(configurationOption),
 				WasOptionExplicitlySpecified(parseResult, configurationOption),
@@ -440,6 +456,521 @@ public static class ProfileCommand
 
 	internal static bool IsRetryableTraceStartupFailure(string? details)
 		=> DotnetTraceRunner.IsRetryableStartupFailure(details);
+
+	internal static CancellationToken ResolvePostProcessingCancellationToken(bool stopRequestedByUser, CancellationToken cancellationToken) =>
+		stopRequestedByUser && cancellationToken.IsCancellationRequested
+			? CancellationToken.None
+			: cancellationToken;
+
+	internal static async Task ConvertNetTraceToMibcAsync(
+		ResolvedMauiProject project,
+		string framework,
+		string configuration,
+		string netTracePath,
+		string mibcPath,
+		IOutputFormatter formatter,
+		bool useJson,
+		bool verbose,
+		CancellationToken cancellationToken)
+	{
+		if (!File.Exists(netTracePath))
+		{
+			throw new MauiToolException(
+				ErrorCodes.InternalError,
+				$"Raw trace '{netTracePath}' was not created, so MIBC conversion cannot continue.");
+		}
+
+		var dotnetPgoPath = ResolveDotnetPgoPath();
+		var referenceAssemblies = ResolveMibcReferenceAssemblies(project, framework, configuration);
+		if (referenceAssemblies.Count == 0)
+		{
+			throw MauiToolException.UserActionRequired(
+				ErrorCodes.DiagnosticsToolNotFound,
+				$"MIBC conversion could not find any reference assemblies for '{project.ProjectName}'.",
+				[
+					$"Build the target '{framework}' first so its output assemblies exist.",
+					"Then run 'maui profile startup --format mibc' again."
+				]);
+		}
+
+		if (!useJson)
+			formatter.WriteInfo("Converting the raw trace to MIBC...");
+
+		var args = BuildMibcArguments(netTracePath, mibcPath, referenceAssemblies).ToArray();
+		ProfileCommandProcessHelpers.WriteVerbose(
+			formatter,
+			useJson,
+			verbose,
+			$"dotnet-pgo command: {ProfileCommandProcessHelpers.FormatCommandLine(dotnetPgoPath, args)}");
+
+		var result = await ProcessRunner.RunAsync(
+			dotnetPgoPath,
+			args,
+			project.ProjectDirectory,
+			timeout: s_buildLaunchTimeout,
+			cancellationToken: cancellationToken);
+
+		if (!result.Success)
+			throw ProfileCommandProcessHelpers.CreateProcessFailureException("dotnet-pgo create-mibc", result);
+	}
+
+	internal static IEnumerable<string> BuildMibcArguments(
+		string netTracePath,
+		string mibcPath,
+		IReadOnlyList<string> referenceAssemblies)
+	{
+		var args = new List<string>
+		{
+			"create-mibc",
+			"--trace",
+			netTracePath,
+			"--output",
+			mibcPath
+		};
+
+		foreach (var referenceAssembly in referenceAssemblies)
+		{
+			args.Add("--reference");
+			args.Add(referenceAssembly);
+		}
+
+		return args;
+	}
+
+	static string ResolveDotnetPgoPath()
+	{
+		var dotnetPgoPath = TryResolveDotnetPgoPath();
+		if (!string.IsNullOrWhiteSpace(dotnetPgoPath))
+			return dotnetPgoPath;
+
+		var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+		var installPath = string.IsNullOrWhiteSpace(userProfile)
+			? DotnetPgoDisplayPath
+			: GetDotnetPgoInstallPath(userProfile);
+
+		throw MauiToolException.UserActionRequired(
+			ErrorCodes.DiagnosticsToolNotFound,
+			$"MIBC conversion requires dotnet-pgo at '{installPath}'.",
+			[
+				$"Install or copy the dotnet-pgo binary to {DotnetPgoDisplayPath}.",
+				"Then rerun 'maui profile startup --format mibc'."
+			]);
+	}
+
+	static async Task<string> EnsureDotnetPgoAvailableAsync(
+		IOutputFormatter formatter,
+		bool useJson,
+		bool verbose,
+		CancellationToken cancellationToken)
+	{
+		if (TryResolveDotnetPgoPath() is { } installedPath)
+			return installedPath;
+
+		if (!useJson)
+		{
+			formatter.WriteInfo($"dotnet-pgo was not found at {DotnetPgoDisplayPath}.");
+			formatter.WriteInfo("Building dotnet-pgo from dotnet/runtime source...");
+		}
+
+		return await BuildDotnetPgoFromSourceAsync(formatter, useJson, verbose, cancellationToken);
+	}
+
+	static string? TryResolveDotnetPgoPath()
+	{
+		var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+		if (string.IsNullOrWhiteSpace(userProfile))
+			return null;
+
+		var expectedPath = GetDotnetPgoInstallPath(userProfile);
+		if (File.Exists(expectedPath))
+			return expectedPath;
+
+		if (OperatingSystem.IsWindows())
+		{
+			var windowsPath = expectedPath + ".exe";
+			if (File.Exists(windowsPath))
+				return windowsPath;
+		}
+
+		return null;
+	}
+
+	internal static string GetDotnetPgoInstallPath(string userProfile)
+	{
+		ArgumentException.ThrowIfNullOrWhiteSpace(userProfile);
+		return Path.Combine(userProfile, ".maui", "dotnet-pgo");
+	}
+
+	internal static string[] BuildDotnetPgoPublishArguments(string runtimeIdentifier, string outputDirectory) =>
+	[
+		"publish",
+		DotnetPgoProjectPath,
+		"-c", "Release",
+		"-r", runtimeIdentifier,
+		"--self-contained",
+		"-p:UseAppHost=true",
+		"-p:PublishSingleFile=true",
+		"-p:PublishTrimmed=false",
+		"-p:TreatWarningsAsErrors=false",
+		"-o", outputDirectory
+	];
+
+	internal static string? ParseLatestStableDotnetRuntimeReleaseBranch(string? lsRemoteOutput)
+	{
+		if (string.IsNullOrWhiteSpace(lsRemoteOutput))
+			return null;
+
+		return lsRemoteOutput
+			.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+			.Select(line => line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).LastOrDefault())
+			.Where(token => !string.IsNullOrWhiteSpace(token))
+			.Select(token =>
+			{
+				var value = token!;
+				const string prefix = "refs/heads/";
+				if (value.StartsWith(prefix, StringComparison.Ordinal))
+					value = value[prefix.Length..];
+
+				if (!value.StartsWith("release/", StringComparison.Ordinal))
+					return null;
+
+				var versionText = value["release/".Length..];
+				return Version.TryParse(versionText, out var version)
+					? new { Branch = value, Version = version }
+					: null;
+			})
+			.Where(candidate => candidate is not null)
+			.OrderByDescending(candidate => candidate!.Version)
+			.Select(candidate => candidate!.Branch)
+			.FirstOrDefault();
+	}
+
+	static async Task<string> ResolveDotnetPgoSourceBranchAsync(
+		string gitPath,
+		IOutputFormatter formatter,
+		bool useJson,
+		bool verbose,
+		CancellationToken cancellationToken)
+	{
+		var overrideBranch = Environment.GetEnvironmentVariable(DotnetPgoBranchEnvironmentVariable);
+		if (!string.IsNullOrWhiteSpace(overrideBranch))
+		{
+			ProfileCommandProcessHelpers.WriteVerbose(
+				formatter,
+				useJson,
+				verbose,
+				$"Using dotnet-pgo source branch override from {DotnetPgoBranchEnvironmentVariable}: {overrideBranch}");
+			return overrideBranch.Trim();
+		}
+
+		var lsRemoteResult = await ProcessRunner.RunAsync(
+			gitPath,
+			["ls-remote", "--heads", DotnetPgoRuntimeRepoUrl, "refs/heads/release/*"],
+			timeout: TimeSpan.FromSeconds(30),
+			cancellationToken: cancellationToken);
+
+		if (lsRemoteResult.Success &&
+			ParseLatestStableDotnetRuntimeReleaseBranch(lsRemoteResult.StandardOutput) is { } latestStableBranch)
+		{
+			ProfileCommandProcessHelpers.WriteVerbose(
+				formatter,
+				useJson,
+				verbose,
+				$"Selected latest stable dotnet/runtime release branch for dotnet-pgo: {latestStableBranch}");
+			return latestStableBranch;
+		}
+
+		if (!useJson)
+			formatter.WriteWarning($"Could not detect the latest stable dotnet/runtime release branch automatically. Falling back to {DotnetPgoFallbackBranch}.");
+
+		return DotnetPgoFallbackBranch;
+	}
+
+	internal static string GetCurrentRuntimeIdentifier()
+	{
+		var os = OperatingSystem.IsMacOS() ? "osx"
+			: OperatingSystem.IsLinux() ? "linux"
+			: OperatingSystem.IsWindows() ? "win"
+			: throw new MauiToolException(
+				ErrorCodes.PlatformNotSupported,
+				"Building dotnet-pgo from source is only supported on macOS, Linux, and Windows.");
+
+		var arch = RuntimeInformation.OSArchitecture switch
+		{
+			Architecture.X64 => "x64",
+			Architecture.Arm64 => "arm64",
+			_ => throw new MauiToolException(
+				ErrorCodes.PlatformNotSupported,
+				$"Building dotnet-pgo from source is not supported on architecture '{RuntimeInformation.OSArchitecture}'.")
+		};
+
+		return $"{os}-{arch}";
+	}
+
+	static async Task<string> BuildDotnetPgoFromSourceAsync(
+		IOutputFormatter formatter,
+		bool useJson,
+		bool verbose,
+		CancellationToken cancellationToken)
+	{
+		var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+		if (string.IsNullOrWhiteSpace(userProfile))
+		{
+			throw new MauiToolException(
+				ErrorCodes.DiagnosticsToolNotFound,
+				"Could not resolve the current user's home directory to locate or build dotnet-pgo.");
+		}
+
+		var gitPath = ProcessRunner.GetCommandPath("git");
+		if (gitPath is null)
+		{
+			throw MauiToolException.UserActionRequired(
+				ErrorCodes.DiagnosticsToolNotFound,
+				"Building dotnet-pgo from source requires 'git', but it was not found in PATH.",
+				[
+					"Install git and rerun 'maui profile startup --format mibc'.",
+					$"Or manually place the dotnet-pgo binary at {DotnetPgoDisplayPath}."
+				]);
+		}
+
+		var dotnetPath = ProcessRunner.GetCommandPath("dotnet") ?? "dotnet";
+		var cloneDirectory = Path.Combine(Path.GetTempPath(), $"dotnet-runtime-{Guid.NewGuid():N}");
+		var publishDirectory = Path.Combine(cloneDirectory, "artifacts", "dotnet-pgo");
+
+		try
+		{
+			var branch = await ResolveDotnetPgoSourceBranchAsync(gitPath, formatter, useJson, verbose, cancellationToken);
+
+			ProfileCommandProcessHelpers.WriteVerbose(
+				formatter,
+				useJson,
+				verbose,
+				$"Cloning {DotnetPgoRuntimeRepoUrl} ({branch}) into {cloneDirectory}.");
+
+			var cloneResult = await RunWithOptionalStatusAsync(
+				formatter,
+				useJson,
+				$"Cloning dotnet/runtime ({branch})...",
+				reportLine => ProcessRunner.RunAsync(
+					gitPath,
+					["clone", "--depth", "1", "--single-branch", "--branch", branch, DotnetPgoRuntimeRepoUrl, cloneDirectory],
+					timeout: s_buildLaunchTimeout,
+					onOutputData: reportLine,
+					onErrorData: reportLine,
+					cancellationToken: cancellationToken));
+			if (!cloneResult.Success)
+				throw ProfileCommandProcessHelpers.CreateProcessFailureException("git clone", cloneResult);
+
+			var publishArgs = BuildDotnetPgoPublishArguments(GetCurrentRuntimeIdentifier(), publishDirectory);
+			ProfileCommandProcessHelpers.WriteVerbose(
+				formatter,
+				useJson,
+				verbose,
+				$"Publishing dotnet-pgo via {ProfileCommandProcessHelpers.FormatCommandLine(dotnetPath, publishArgs)}");
+
+			var publishResult = await RunWithOptionalStatusAsync(
+				formatter,
+				useJson,
+				$"Publishing dotnet-pgo for {GetCurrentRuntimeIdentifier()}...",
+				reportLine => ProcessRunner.RunAsync(
+					dotnetPath,
+					publishArgs,
+					cloneDirectory,
+					timeout: s_buildLaunchTimeout,
+					onOutputData: reportLine,
+					onErrorData: reportLine,
+					cancellationToken: cancellationToken));
+			if (!publishResult.Success)
+				throw ProfileCommandProcessHelpers.CreateProcessFailureException("dotnet publish", publishResult);
+
+			var builtBinaryPath = Directory.EnumerateFiles(
+				publishDirectory,
+				OperatingSystem.IsWindows() ? "dotnet-pgo.exe" : "dotnet-pgo",
+				SearchOption.AllDirectories).FirstOrDefault();
+
+			if (string.IsNullOrWhiteSpace(builtBinaryPath))
+			{
+				throw new MauiToolException(
+					ErrorCodes.DiagnosticsToolNotFound,
+					$"dotnet publish completed, but the dotnet-pgo binary was not found under '{publishDirectory}'.");
+			}
+
+			var installDirectory = Path.Combine(userProfile, ".maui");
+			Directory.CreateDirectory(installDirectory);
+
+			var installPath = OperatingSystem.IsWindows()
+				? GetDotnetPgoInstallPath(userProfile) + ".exe"
+				: GetDotnetPgoInstallPath(userProfile);
+
+			File.Copy(builtBinaryPath, installPath, overwrite: true);
+
+			if (!OperatingSystem.IsWindows())
+			{
+				File.SetUnixFileMode(
+					installPath,
+					UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+					UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
+					UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+			}
+
+			if (!useJson)
+				formatter.WriteInfo($"Installed dotnet-pgo to {installPath}.");
+
+			return installPath;
+		}
+		finally
+		{
+			try
+			{
+				if (Directory.Exists(cloneDirectory))
+					Directory.Delete(cloneDirectory, recursive: true);
+			}
+			catch
+			{
+				// Best-effort cleanup for the temporary runtime clone.
+			}
+		}
+	}
+
+	static async Task<T> RunWithOptionalStatusAsync<T>(
+		IOutputFormatter formatter,
+		bool useJson,
+		string message,
+		Func<Action<string>?, Task<T>> operation)
+	{
+		if (formatter is SpectreOutputFormatter spectre && !useJson)
+		{
+			var recentLines = new Queue<string>();
+			var syncLock = new object();
+			var lastRefreshUtc = DateTime.MinValue;
+
+			return await spectre.StatusAsync(FormatStatusMessage(message, recentLines), async statusContext =>
+			{
+				void ReportLine(string line)
+				{
+					string? updatedStatus = null;
+
+					lock (syncLock)
+					{
+						if (!AppendStatusTailLine(recentLines, line))
+							return;
+
+						var now = DateTime.UtcNow;
+						if (now - lastRefreshUtc < TimeSpan.FromMilliseconds(75))
+							return;
+
+						lastRefreshUtc = now;
+						updatedStatus = FormatStatusMessage(message, recentLines);
+					}
+
+					if (updatedStatus is not null)
+						statusContext.Status(updatedStatus);
+				}
+
+				var result = await operation(ReportLine);
+
+				lock (syncLock)
+					statusContext.Status(FormatStatusMessage(message, recentLines));
+
+				return result;
+			});
+		}
+
+		if (!useJson)
+			formatter.WriteInfo(message);
+
+		return await operation(null);
+	}
+
+	internal static bool AppendStatusTailLine(Queue<string> recentLines, string? line, int maxLines = DotnetPgoStatusTailLineCount)
+	{
+		ArgumentNullException.ThrowIfNull(recentLines);
+
+		if (string.IsNullOrWhiteSpace(line))
+			return false;
+
+		var normalizedLine = string.Join(" ", line.Trim().Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+		if (normalizedLine.Length > DotnetPgoStatusMaxLineLength)
+			normalizedLine = normalizedLine[..(DotnetPgoStatusMaxLineLength - 3)] + "...";
+
+		recentLines.Enqueue(normalizedLine);
+		while (recentLines.Count > maxLines)
+			recentLines.Dequeue();
+
+		return true;
+	}
+
+	internal static string FormatStatusMessage(string message, IEnumerable<string> recentLines)
+	{
+		ArgumentException.ThrowIfNullOrWhiteSpace(message);
+
+		var lines = recentLines
+			.Where(static line => !string.IsNullOrWhiteSpace(line))
+			.ToArray();
+
+		if (lines.Length == 0)
+			return Markup.Escape(message);
+
+		var builder = new StringBuilder(Markup.Escape(message));
+		foreach (var line in lines)
+		{
+			builder.AppendLine();
+			builder.Append("[grey]");
+			builder.Append(Markup.Escape($"  {line}"));
+			builder.Append("[/]");
+		}
+
+		return builder.ToString();
+	}
+
+	static IReadOnlyList<string> ResolveMibcReferenceAssemblies(
+		ResolvedMauiProject project,
+		string framework,
+		string configuration)
+	{
+		var candidateRoots = GetMibcReferenceSearchRoots(project, framework, configuration).ToArray();
+		if (candidateRoots.Length == 0)
+			return [];
+
+		var linkedOrShrunkAssemblies = candidateRoots
+			.SelectMany(root => Directory.EnumerateFiles(root, "*.dll", SearchOption.AllDirectories))
+			.Where(static path => path.Contains($"{Path.DirectorySeparatorChar}linked{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase)
+				|| path.Contains($"{Path.AltDirectorySeparatorChar}linked{Path.AltDirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase)
+				|| path.Contains($"{Path.DirectorySeparatorChar}shrunk{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase)
+				|| path.Contains($"{Path.AltDirectorySeparatorChar}shrunk{Path.AltDirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase))
+			.Distinct(StringComparer.OrdinalIgnoreCase)
+			.OrderBy(static path => path, StringComparer.OrdinalIgnoreCase)
+			.ToArray();
+
+		if (linkedOrShrunkAssemblies.Length > 0)
+			return linkedOrShrunkAssemblies;
+
+		return candidateRoots
+			.SelectMany(root => Directory.EnumerateFiles(root, "*.dll", SearchOption.AllDirectories))
+			.Distinct(StringComparer.OrdinalIgnoreCase)
+			.OrderBy(static path => path, StringComparer.OrdinalIgnoreCase)
+			.ToArray();
+	}
+
+	static IEnumerable<string> GetMibcReferenceSearchRoots(
+		ResolvedMauiProject project,
+		string framework,
+		string configuration)
+	{
+		var searchRoots = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+		{
+			Path.Combine(project.ProjectDirectory, "obj", configuration, framework),
+			Path.Combine(project.ProjectDirectory, "bin", configuration, framework)
+		};
+
+		for (var current = new DirectoryInfo(project.ProjectDirectory); current is not null; current = current.Parent)
+		{
+			searchRoots.Add(Path.Combine(current.FullName, "artifacts", "obj", project.ProjectName, configuration, framework));
+			searchRoots.Add(Path.Combine(current.FullName, "artifacts", "bin", project.ProjectName, configuration, framework));
+		}
+
+		return searchRoots.Where(Directory.Exists);
+	}
 
 	internal static int FindAvailableTcpPort(int startingPort, int maxPort = IPEndPoint.MaxPort)
 		=> ProfileCommandPortRouter.FindAvailableTcpPort(startingPort, maxPort);

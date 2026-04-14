@@ -7,6 +7,7 @@ using System.Net.Sockets;
 using Microsoft.Maui.Cli.Commands;
 using Microsoft.Maui.Cli.Errors;
 using Microsoft.Maui.Cli.Models;
+using Microsoft.Maui.Cli.Utils;
 using Xunit;
 
 namespace Microsoft.Maui.Cli.UnitTests;
@@ -118,6 +119,18 @@ public class ProfileCommandTests
 			spectre: null);
 
 		Assert.Equal(TraceOutputFormat.Speedscope, result);
+	}
+
+	[Fact]
+	public void ResolveTraceOutputFormat_UsesExplicitMibcValue()
+	{
+		var result = ProfileCommand.ResolveTraceOutputFormat(
+			requestedFormat: "mibc",
+			explicitlySpecified: true,
+			nonInteractive: false,
+			spectre: null);
+
+		Assert.Equal(TraceOutputFormat.Mibc, result);
 	}
 
 	[Fact]
@@ -284,6 +297,122 @@ public class ProfileCommandTests
 	{
 		var path = ProfileCommand.GetPrimaryOutputPath("/tmp/my-trace.nettrace", TraceOutputFormat.Speedscope);
 		Assert.Equal("/tmp/my-trace.nettrace.speedscope.json", path);
+	}
+
+	[Fact]
+	public void ResolveOutputPath_MibcStripsRequestedMibcSuffix()
+	{
+		var path = ProfileCommand.ResolveOutputPath("MyApp", "/tmp/my-trace.mibc", TraceOutputFormat.Mibc);
+		Assert.Equal(Path.GetFullPath("/tmp/my-trace.nettrace"), path);
+	}
+
+	[Fact]
+	public void GetPrimaryOutputPath_MibcUsesSiblingMibcFile()
+	{
+		var path = ProfileCommand.GetPrimaryOutputPath("/tmp/my-trace.nettrace", TraceOutputFormat.Mibc);
+		Assert.Equal("/tmp/my-trace.mibc", path);
+	}
+
+	[Fact]
+	public void GetDotnetPgoInstallPath_UsesMauiHomeLocation()
+	{
+		var path = DotnetPgoInstaller.GetInstallPath("/Users/tester");
+		Assert.Equal("/Users/tester/.maui/dotnet-pgo", path);
+	}
+
+	[Fact]
+	public void BuildDotnetPgoPublishArguments_UsesSingleFileSelfContainedPublish()
+	{
+		var args = DotnetPgoInstaller.BuildPublishArguments("osx-arm64", "/tmp/dotnet-pgo-build");
+
+		Assert.Contains("publish", args);
+		Assert.Contains("src/coreclr/tools/dotnet-pgo/dotnet-pgo.csproj", args);
+		Assert.Contains("--self-contained", args);
+		Assert.Contains("-p:UseAppHost=true", args);
+		Assert.Contains("-p:PublishSingleFile=true", args);
+		Assert.Contains("-p:PublishTrimmed=false", args);
+		Assert.Contains("/tmp/dotnet-pgo-build", args);
+	}
+
+	[Fact]
+	public void ParseLatestStableDotnetRuntimeReleaseBranch_PicksHighestRelease()
+	{
+		var lsRemoteOutput = """
+			abc123	refs/heads/release/9.0
+			def456	refs/heads/release/10.0
+			ghi789	refs/heads/release/8.0
+			jkl012	refs/heads/main
+			""";
+
+		var branch = DotnetPgoInstaller.ParseLatestStableReleaseBranch(lsRemoteOutput);
+
+		Assert.Equal("release/10.0", branch);
+	}
+
+	[Fact]
+	public void ParseLatestStableDotnetRuntimeReleaseBranch_ReturnsNullWithoutStableRelease()
+	{
+		var lsRemoteOutput = """
+			abc123	refs/heads/main
+			def456	refs/heads/feature/test
+			""";
+
+		var branch = DotnetPgoInstaller.ParseLatestStableReleaseBranch(lsRemoteOutput);
+
+		Assert.Null(branch);
+	}
+
+	[Fact]
+	public void GetCurrentRuntimeIdentifier_ReturnsSupportedRidFormat()
+	{
+		var rid = DotnetPgoInstaller.GetCurrentRuntimeIdentifier();
+		Assert.Matches("^(osx|linux|win)-(x64|arm64)$", rid);
+	}
+
+	[Fact]
+	public void AppendStatusTailLine_KeepsOnlyTheMostRecentLines()
+	{
+		var lines = new Queue<string>();
+
+		for (var i = 1; i <= 7; i++)
+			DotnetPgoInstaller.AppendStatusTailLine(lines, $"line {i}");
+
+		Assert.Equal(["line 3", "line 4", "line 5", "line 6", "line 7"], lines.ToArray());
+	}
+
+	[Fact]
+	public void FormatStatusMessage_IncludesEscapedRecentOutput()
+	{
+		var message = DotnetPgoInstaller.FormatStatusMessage(
+			"Publishing dotnet-pgo...",
+			["Restored [package]", "Build succeeded"]);
+
+		Assert.Contains("Publishing dotnet-pgo...", message);
+		Assert.Contains("Restored", message);
+		Assert.Contains("[grey]", message);
+		Assert.Contains("Build succeeded", message);
+	}
+
+	[Fact]
+	public void ResolvePostProcessingCancellationToken_PreservesCancellationForNormalCompletion()
+	{
+		using var cts = new CancellationTokenSource();
+		cts.Cancel();
+
+		var token = ProfileCommand.ResolvePostProcessingCancellationToken(stopRequestedByUser: false, cts.Token);
+
+		Assert.True(token.IsCancellationRequested);
+	}
+
+	[Fact]
+	public void ResolvePostProcessingCancellationToken_IgnoresCtrlCCancellationAfterManualStop()
+	{
+		using var cts = new CancellationTokenSource();
+		cts.Cancel();
+
+		var token = ProfileCommand.ResolvePostProcessingCancellationToken(stopRequestedByUser: true, cts.Token);
+
+		Assert.False(token.IsCancellationRequested);
 	}
 
 	// ── Tool version parsing ──────────────────────────────────────────────────
@@ -537,6 +666,69 @@ public class ProfileCommandTests
 		var formatIdx = Array.IndexOf(args, "--format");
 		Assert.True(formatIdx >= 0);
 		Assert.Equal("Speedscope", args[formatIdx + 1]);
+	}
+
+	[Fact]
+	public void BuildTraceArguments_Mibc_UsesNetTraceCollectorFormat()
+	{
+		var args = ProfileCommand.BuildTraceArguments(
+			outputPath: "/out.nettrace",
+			outputFormat: TraceOutputFormat.Mibc,
+			dsrouterPid: 12345,
+			traceProfile: null,
+			duration: null,
+			stoppingEventProvider: null,
+			stoppingEventName: null,
+			stoppingEventPayloadFilter: null).ToArray();
+
+		var formatIdx = Array.IndexOf(args, "--format");
+		Assert.True(formatIdx >= 0);
+		Assert.Equal("NetTrace", args[formatIdx + 1]);
+
+		var profileIdx = Array.IndexOf(args, "--profile");
+		Assert.True(profileIdx >= 0);
+		Assert.Equal("dotnet-common,dotnet-sampled-thread-time", args[profileIdx + 1]);
+
+		var providersIdx = Array.IndexOf(args, "--providers");
+		Assert.True(providersIdx >= 0);
+		Assert.Contains("Microsoft-Windows-DotNETRuntime:0x1F000080018:5", args[providersIdx + 1]);
+	}
+
+	[Fact]
+	public void BuildTraceArguments_MibcWithUserProfile_KeepsProfileAndAddsRuntimeProvider()
+	{
+		var args = ProfileCommand.BuildTraceArguments(
+			outputPath: "/out.nettrace",
+			outputFormat: TraceOutputFormat.Mibc,
+			dsrouterPid: 12345,
+			traceProfile: "gc-verbose",
+			duration: null,
+			stoppingEventProvider: null,
+			stoppingEventName: null,
+			stoppingEventPayloadFilter: null).ToArray();
+
+		var profileIdx = Array.IndexOf(args, "--profile");
+		Assert.True(profileIdx >= 0);
+		Assert.Equal("gc-verbose", args[profileIdx + 1]);
+
+		var providersIdx = Array.IndexOf(args, "--providers");
+		Assert.True(providersIdx >= 0);
+		Assert.Contains("Microsoft-Windows-DotNETRuntime:0x1F000080018:5", args[providersIdx + 1]);
+	}
+
+	[Fact]
+	public void MauiStartupProfilingInjectionTargets_IncludeDynamicPgoEnvironmentVariables()
+	{
+		var targetsPath = Path.GetFullPath(Path.Combine(
+			AppContext.BaseDirectory,
+			"../../../../../src/Cli/Microsoft.Maui.Cli/Build/MauiStartupProfilingInjection.targets"));
+
+		var contents = File.ReadAllText(targetsPath);
+
+		Assert.Contains("MauiStartupProfilingEnableMibcPgo", contents);
+		Assert.Contains("DOTNET_TieredPGO=1", contents);
+		Assert.Contains("DOTNET_ReadyToRun=0", contents);
+		Assert.Contains("DOTNET_JitMinimalJitProfiling=1", contents);
 	}
 
 
